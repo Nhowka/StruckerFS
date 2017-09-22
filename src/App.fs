@@ -89,7 +89,7 @@ type Player =
     }
     static member Create n = {Hand=[];Order=n; SelectedCards=None; LastRendering=Rect.Empty; IsHuman = true}
     member t.DrawTo((ctx:Browser.CanvasRenderingContext2D),({p={x=x; y=y} as p;s={w=w;h=h} as s} as rect)) =
-        
+        t.SelectedCards |> Option.iter (fun (a,b) -> [a;b] |> List.zip (spreadOn (List.length t.Hand) p s) |> List.iter (fun (r,e)->e.DrawTo(ctx,r) |> ignore))
         {t with LastRendering=rect;Hand=t.Hand |> List.zip (spreadOn (List.length t.Hand) p s) |> List.map (fun (r,e)->e.DrawTo(ctx,r))}
 
 type GameState =
@@ -107,20 +107,44 @@ type GameState =
         {Deck=Deck.NewShuffle();TeamOne=0;TeamTwo=0;Round=Array.zeroCreate 3;Table=[];PlayerToPlay=players.[0];Players=players}
 
 type DrawingMessages =
-    | DrawCanvas of GameState*AsyncReplyChannel<GameState>
+    | DrawAndUpdate of GameState*AsyncReplyChannel<GameState>
+    
 
 type GameMessages =
     | Reset
+    | NextRound
     | Draw
-    | PlayCards of Player*Card[]
+    | PlayCards of Player*(Card*Card)
     | SendClick of x:float*y:float
-    
+
+let getRect {h=h;w=w} n =  
+    let s = (min h w)*0.2
+    let t = (min h w)*0.5
+    let (x',y')=
+        match (h,w) with
+        |(h,w) when h>w -> 0.,(h-w)/4.
+        |(h,w) when h<w -> (w-h)/4.,0.
+        |_ -> 0.,0.
+    match n with
+    |1 -> {p={x=x';y=(h-t)/2.};s={h=t;w=s}}
+    |2 -> {p={x=(w-t)/2.;y=y'};s={h=s;w=t}}
+    |3 -> {p={x=w-s-x';y=(h-t)/2.};s={h=t;w=s}}
+    |0 -> {p={x=(w-t)/2.;y=h-s-y'};s={h=s;w=t}}
+    |_ -> {p={x=(w-t)/2.;y=(h-s)/2.};s={h=s;w=t}}
+
 let drawing = MailboxProcessor.Start <| fun n ->
     let rec proc (body:Browser.HTMLBodyElement) (canvas:Browser.HTMLCanvasElement) = async{
-        let! DrawCanvas (g,r) = n.Receive()
+        let! DrawAndUpdate(g,r) = n.Receive()
+        canvas.width <- body.clientWidth
+        canvas.height <- body.clientHeight        
         let ctx = canvas.getContext_2d()
-        let gp' = g.Players |> Array.map (fun t-> t.DrawTo(ctx, Rect.Empty))        
-        r.Reply {g with Players=gp'}
+        let rc = {h=body.clientHeight;w=body.clientWidth}
+        let p = g.Players |> Array.mapi (fun n t-> t.DrawTo(ctx, getRect rc n))
+        let {p=p';s=s'}= getRect rc 4
+        g.Table |> printfn "%A"
+        g.Table |> List.zip (spreadOn (List.length g.Table) p' s') |> List.iter (fun (r,e)->e.DrawTo(ctx,r) |> ignore)                      
+        r.Reply {g with Players=p}
+        printfn "Draw Called"        
         return! proc body canvas
     }
     proc (Browser.document.body :?> Browser.HTMLBodyElement) (Browser.document.getElementsByTagName_canvas().[0])
@@ -133,13 +157,32 @@ let rec game = MailboxProcessor.Start <| fun n ->
             let! m = n.Receive()
             match m with
             | Draw ->
-                printfn "Draw called"
-                let! g = drawing.PostAndAsyncReply (fun n -> DrawCanvas (g,n))
+                //printfn "Draw called"
+                let! g = drawing.PostAndAsyncReply (fun n -> DrawAndUpdate (g,n))
                 return! proc g
-            | Reset -> failwith "Not Implemented"
+            | Reset -> 
+                game.Post NextRound
+                return! proc GameState.Empty
             | PlayCards(_, _) -> failwith "Not Implemented"
             | SendClick(x, y) ->                 
-                printfn "%f %f" x y
+                let! g = drawing.PostAndAsyncReply (fun n -> DrawAndUpdate (g,n))
+                return! proc g
+            | NextRound ->                 
+                let rec giveCards (g:GameState) p n d =                    
+                    match (p,n) with
+                    |(0,0) -> {g with Table = d |> List.take 3}
+                    |(0,n) -> giveCards g 4 (n-1) d
+                    |(p,n) ->                        
+                        match d with
+                        |a::b::d ->
+                            let g' = g
+                            let h' = a::b::g'.Players.[p-1].Hand
+                            g'.Players.[p-1]<-{g'.Players.[p-1] with Hand=h'} 
+                            giveCards g' (p-1) n d                            
+                        |_ -> failwith "Deck should have enough cards"
+                let! g = drawing.PostAndAsyncReply (fun n -> DrawAndUpdate (giveCards g 4 2 g.Deck,n))
+                do! Async.Sleep 1000
+                return! proc g
             return! proc g
         }
     proc GameState.Empty
@@ -164,7 +207,7 @@ let init() =
     let canvas = Browser.document.getElementsByTagName_canvas().[0]
     canvas.onclick <- fun e -> game.Post (SendClick (e.clientX, e.clientY))  |> box
     body.onresize <- fun _ -> game.Post Draw :> obj
-    body.onload <- fun _ -> draw() :> obj
+    body.onload <- fun _ -> game.Post NextRound :> obj
     
     
 init()
